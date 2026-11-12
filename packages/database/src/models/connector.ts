@@ -1,5 +1,6 @@
 import type { ConnectorVisibility } from '@lobechat/types';
 import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import pMap from 'p-map';
 
 import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
 import { agentEvalDatasets, ConnectorStatus, userConnectors, userConnectorTools } from '../schemas';
@@ -488,9 +489,9 @@ export class ConnectorModel {
       .where(and(this.scopePredicate(target), inArray(userConnectors.identifier, identifiers)))
       .orderBy(...this.resolutionOrder());
 
-    return Promise.all(
-      this.pickByPriority(rows, target.agentId).map((r) => decryptRow(r, gateKeeper)),
-    );
+    return pMap(this.pickByPriority(rows, target.agentId), (r) => decryptRow(r, gateKeeper), {
+      concurrency: 5,
+    });
   };
 
   /**
@@ -509,9 +510,9 @@ export class ConnectorModel {
       .where(this.scopePredicate(target))
       .orderBy(...this.resolutionOrder());
 
-    return Promise.all(
-      this.pickByPriority(rows, target.agentId).map((r) => decryptRow(r, gateKeeper)),
-    );
+    return pMap(this.pickByPriority(rows, target.agentId), (r) => decryptRow(r, gateKeeper), {
+      concurrency: 5,
+    });
   };
 
   /**
