@@ -556,6 +556,38 @@ export class ConnectorModel {
     return decryptRow(row, gateKeeper);
   };
 
+  /**
+   * Identifiers that already have a connector row anywhere in this
+   * workspace (or, outside a workspace, in the caller's personal scope):
+   * every visibility and every agent binding, whoever created the row.
+   *
+   * Runtime resolution deliberately narrows to what the run may see, so an
+   * identifier can come back empty while the row still exists — a private
+   * connector read by someone else, another agent's row, a mount this agent
+   * did not get. Legacy paths (the plugin projection a connector is mirrored
+   * into) must not resurrect it from the other side: once a connector row
+   * exists the projection is a mirror of that row, so "no visible row" means
+   * "not available in this run", not "fall back to the old path".
+   */
+  identifiersWithConnectorRows = async (identifiers: string[]): Promise<Set<string>> => {
+    if (identifiers.length === 0) return new Set();
+
+    const workspaceId = normalizeWorkspaceId(this.workspaceId);
+    // In a workspace the whole workspace counts, including rows other members
+    // keep private: the projection is workspace-wide, so a row anyone owns
+    // means the identifier is already connector-backed.
+    const scope = workspaceId
+      ? eq(userConnectors.workspaceId, workspaceId)
+      : and(eq(userConnectors.userId, this.userId), isNull(userConnectors.workspaceId));
+
+    const rows = await this.db
+      .selectDistinct({ identifier: userConnectors.identifier })
+      .from(userConnectors)
+      .where(and(scope, inArray(userConnectors.identifier, identifiers)));
+
+    return new Set(rows.map((row) => row.identifier));
+  };
+
   queryReferencesByIdentifiers = async (identifiers: string[]): Promise<ConnectorReference[]> => {
     if (identifiers.length === 0) return [];
 
