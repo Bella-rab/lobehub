@@ -557,6 +557,49 @@ export class ConnectorModel {
   };
 
   /**
+   * The row a connector write should update for this identifier: the caller's
+   * binding in ANY visibility. {@link findScopedByIdentifier} pins the lookup to
+   * one visibility so a create never rewrites the sibling row; a refresh already
+   * owns a row and must find it either way, otherwise switching a connector to
+   * private makes the next refresh miss it and create a second, public row for
+   * the same account — republishing it to the workspace.
+   *
+   * The caller's own private row wins over the shared one, matching
+   * {@link pickByPriority}.
+   */
+  findManageableByIdentifier = async (
+    identifier: string,
+    agentId?: string,
+  ): Promise<{
+    agentId: string | null;
+    id: string;
+    metadata: UserConnectorItem['metadata'];
+    userId: string;
+    visibility: ConnectorVisibility;
+  } | null> => {
+    const rows = await this.db
+      .select({
+        agentId: userConnectors.agentId,
+        id: userConnectors.id,
+        metadata: userConnectors.metadata,
+        userId: userConnectors.userId,
+        visibility: userConnectors.visibility,
+      })
+      .from(userConnectors)
+      .where(
+        and(
+          this.ownership(),
+          eq(userConnectors.identifier, identifier),
+          agentId ? eq(userConnectors.agentId, agentId) : isNull(userConnectors.agentId),
+        ),
+      )
+      .orderBy(asc(userConnectors.id));
+
+    if (rows.length === 0) return null;
+    return rows.find((row) => row.visibility === 'private') ?? rows[0];
+  };
+
+  /**
    * Identifiers that already have a connector row anywhere in this
    * workspace (or, outside a workspace, in the caller's personal scope):
    * every visibility and every agent binding, whoever created the row.
