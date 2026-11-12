@@ -1,11 +1,18 @@
+import type { ConnectorVisibility } from '@lobechat/types';
 import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 
 import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
 import { agentEvalDatasets, ConnectorStatus, userConnectors, userConnectorTools } from '../schemas';
 import type { LobeChatDatabase } from '../type';
-import { buildWorkspacePayload, buildWorkspaceWhere } from '../utils/workspace';
+import {
+  buildWorkspacePayload,
+  buildWorkspaceWhere,
+  normalizeWorkspaceId,
+} from '../utils/workspace';
 import { EvalConnectorUpdateError, normalizeEvalConnectorPatch } from './connectorEval';
-import { connectorAccessScope } from './connectorScope';
+import { connectorAccessScope, connectorRunScope, type ConnectorRunTarget } from './connectorScope';
+
+export type { ConnectorRunTarget } from './connectorScope';
 
 interface GateKeeper {
   decrypt: (ciphertext: string) => Promise<{ plaintext: string }>;
@@ -41,6 +48,7 @@ export interface PublicConnectorRecord {
   updatedAt: Date;
   /** Row creator. Needed for row-level manage checks; never surfaced to API responses. */
   userId: string;
+  visibility: ConnectorVisibility;
 }
 
 export interface ComposioConnectorReference extends ConnectorReference {
@@ -104,6 +112,21 @@ export class ConnectorModel {
   private baseScope = () => and(this.ownership(), isNull(userConnectors.agentId));
 
   /**
+   * Base rows an agentless runtime lookup may use. In a workspace that is the
+   * shared rows only: a member's private connector serves their private agents
+   * and nothing else (not a client-side call without an agent, not a dashboard
+   * read another member can see). The management view ({@link baseScope}) also
+   * lists the caller's own private rows.
+   */
+  private sharedBaseScope = () =>
+    and(
+      this.evaluationDatasetId
+        ? this.ownership()
+        : connectorRunScope(this.db, { userId: this.userId, workspaceId: this.workspaceId }, {}),
+      isNull(userConnectors.agentId),
+    );
+
+  /**
    * Deterministic connector order for runtime resolution: by identifier, then id
    * so rows sharing an identifier have a stable tie-break. Resolved connectors
    * drive the order of the model's tool schema array, so they must not follow
@@ -128,11 +151,14 @@ export class ConnectorModel {
     status: userConnectors.status,
     updatedAt: userConnectors.updatedAt,
     userId: userConnectors.userId,
+    visibility: userConnectors.visibility,
   };
 
   /**
-   * Candidate rows for agent-aware resolution within the current scope. For an
-   * agent this is:
+   * Candidate rows for agent-aware resolution. The base rows come from
+   * {@link connectorRunScope}: a workspace run sees the shared rows, and a
+   * private agent's run in its own topic also sees its owner's private and
+   * personal rows. On top of that, for an agent:
    * - agent-OWNED rows (`agent_id = agentId`) — the Copy / Connect-new flows;
    * - base rows (`agent_id IS NULL`) that are either MOUNTED by this agent
    *   (`metadata.mountedByAgentId = agentId`, the Linked flow) or free (not
@@ -140,8 +166,14 @@ export class ConnectorModel {
    * A base row mounted (locked) by *another* agent is excluded, so a mounted
    * connector can serve only its one agent. Without an agent, only free base
    * rows are candidates.
+   *
+   * An evaluation model keeps its own Dataset scope ({@link ownership}).
    */
-  private scopePredicate = (agentId?: string) => {
+  private scopePredicate = (target: ConnectorRunTarget) => {
+    const { agentId } = target;
+    const base = this.evaluationDatasetId
+      ? this.ownership()
+      : connectorRunScope(this.db, { userId: this.userId, workspaceId: this.workspaceId }, target);
     // COALESCE'd to a sentinel rather than null-tested: `->> … IS NULL` in a
     // WHERE clause is one bm25 index on `user_connectors` away from taking every
     // caller down at plan time. See the note on `TopicModel`. `''` is a safe
@@ -150,10 +182,10 @@ export class ConnectorModel {
     // Private Dataset imports are usable only through an exact evaluation binding.
     // Exclude them before priority selection and credential decryption in ordinary chat.
     if (!agentId) {
-      return and(this.ownership(), isNull(userConnectors.agentId), sql`${mountedBy} = ''`);
+      return and(base, isNull(userConnectors.agentId), sql`${mountedBy} = ''`);
     }
     return and(
-      this.ownership(),
+      base,
       or(
         eq(userConnectors.agentId, agentId),
         and(
@@ -165,23 +197,66 @@ export class ConnectorModel {
   };
 
   /**
-   * Reduce candidate rows to at most one per identifier by priority within the
-   * current scope: agent-OWNED (2) > MOUNTED by this agent (1) > free base (0).
-   * Resolution never crosses the base scope: a workspace run resolves within the
-   * workspace, a personal run within personal — no cross-scope personal fallback.
+   * Reduce candidate rows to at most one per identifier. Rows are ranked by
+   * binding first, then by whose connection it is:
+   *
+   * 1. binding — agent-OWNED by this agent > MOUNTED by this agent > free base;
+   * 2. within a binding — the owner's private row in this workspace > the
+   *    owner's personal row > the workspace's shared row. A private agent's
+   *    owner chose their own connection for their own agent, so it shadows
+   *    the shared one; a row made inside this workspace beats one carried
+   *    over from personal space.
+   *
+   * Equal ranks keep the first row in {@link resolutionOrder} (identifier,
+   * then id), so the pick never follows the physical row order. The result
+   * drives the order of the model's tool schema array.
+   *
+   * Only a private agent's run in its own topic can see private or personal
+   * rows at all (see {@link connectorRunScope}); every other run only ranks
+   * shared rows here.
    */
   private pickByPriority = (rows: UserConnectorItem[], agentId?: string): UserConnectorItem[] => {
-    const rank = (row: UserConnectorItem): number => {
+    const workspaceId = normalizeWorkspaceId(this.workspaceId);
+    const bindingRank = (row: UserConnectorItem): number => {
       if (agentId && row.agentId === agentId) return 2;
       if (agentId && row.metadata?.mountedByAgentId === agentId) return 1;
       return 0;
     };
+    const ownershipRank = (row: UserConnectorItem): number => {
+      if (!workspaceId) return 0;
+      if (row.workspaceId === workspaceId && row.visibility === 'private') return 2;
+      if (row.workspaceId === null) return 1;
+      return 0;
+    };
+    const rank = (row: UserConnectorItem) => bindingRank(row) * 3 + ownershipRank(row);
     const byIdentifier = new Map<string, UserConnectorItem>();
     for (const row of rows) {
       const current = byIdentifier.get(row.identifier);
       if (!current || rank(row) > rank(current)) byIdentifier.set(row.identifier, row);
     }
     return [...byIdentifier.values()];
+  };
+
+  /**
+   * The model for a resolved row's own scope. A private agent's workspace run
+   * can resolve its owner's personal rows (`workspace_id IS NULL`), which this
+   * workspace-scoped model cannot write; follow-up writes on such a row (a
+   * rotated OAuth token, a status change) go through the personal scope.
+   * Every other row is already in this model's scope.
+   */
+  forRow = (
+    row: Pick<UserConnectorItem, 'userId' | 'workspaceId'>,
+    gateKeeper: GateKeeper | undefined = this.gateKeeper,
+  ): ConnectorModel => {
+    if (
+      !this.evaluationDatasetId &&
+      normalizeWorkspaceId(this.workspaceId) &&
+      row.workspaceId === null &&
+      row.userId === this.userId
+    ) {
+      return new ConnectorModel(this.db, this.userId, undefined, gateKeeper);
+    }
+    return this;
   };
 
   create = async (
@@ -366,8 +441,9 @@ export class ConnectorModel {
   };
 
   /**
-   * Base (non-agent) rows for the given identifiers. Excludes agent-scoped rows;
-   * use {@link resolveByIdentifiers} for agent-aware runtime resolution.
+   * Base (non-agent) shared rows for the given identifiers (see
+   * {@link sharedBaseScope}). Excludes agent-scoped rows; use
+   * {@link resolveByIdentifiers} for agent-aware runtime resolution.
    */
   queryByIdentifiers = async (
     identifiers: string[],
@@ -378,7 +454,7 @@ export class ConnectorModel {
     const rows = await this.db
       .select()
       .from(userConnectors)
-      .where(and(this.baseScope(), inArray(userConnectors.identifier, identifiers)))
+      .where(and(this.sharedBaseScope(), inArray(userConnectors.identifier, identifiers)))
       .orderBy(...this.resolutionOrder());
 
     return Promise.all(rows.map((r) => decryptRow(r, gateKeeper)));
@@ -386,9 +462,13 @@ export class ConnectorModel {
 
   /**
    * Agent-aware runtime resolution. For each identifier returns at most one
-   * connector, preferring the agent-owned row (`agent_id = agentId`) over the
-   * base row (Agent > Workspace/Personal). When `agentId` is omitted this is
-   * equivalent to {@link queryByIdentifiers} (base rows only).
+   * connector, ranked by {@link pickByPriority} (agent-owned > mounted > free
+   * base, then the owner's private > personal > shared). Without an `agentId`
+   * this resolves the free base rows only.
+   *
+   * `target` decides the base rows (see {@link connectorRunScope}): pass the
+   * run's `topicId` so a private agent can load its owner's private
+   * connectors; any other caller resolves the workspace's shared ones.
    *
    * This is the single entry point runtime paths (aiAgent manifest build,
    * connector exec, MCP call gate, Composio account resolution) must use in
@@ -397,7 +477,7 @@ export class ConnectorModel {
    */
   resolveByIdentifiers = async (
     identifiers: string[],
-    agentId?: string,
+    target: ConnectorRunTarget = {},
     gateKeeper: GateKeeper | undefined = this.gateKeeper,
   ): Promise<DecryptedConnector[]> => {
     if (identifiers.length === 0) return [];
@@ -405,29 +485,33 @@ export class ConnectorModel {
     const rows = await this.db
       .select()
       .from(userConnectors)
-      .where(and(this.scopePredicate(agentId), inArray(userConnectors.identifier, identifiers)))
+      .where(and(this.scopePredicate(target), inArray(userConnectors.identifier, identifiers)))
       .orderBy(...this.resolutionOrder());
 
-    return Promise.all(this.pickByPriority(rows, agentId).map((r) => decryptRow(r, gateKeeper)));
+    return Promise.all(
+      this.pickByPriority(rows, target.agentId).map((r) => decryptRow(r, gateKeeper)),
+    );
   };
 
   /**
-   * Agent-aware variant of {@link query}: every resolvable connector in the
-   * current scope, deduped by identifier with the agent-owned row winning. Used
-   * to enumerate connectors for a run (e.g. Composio manifest building) where
-   * the agent's own connector should shadow the base one.
+   * Agent-aware variant of {@link query}: every connector the run may resolve,
+   * deduped by identifier with {@link pickByPriority}. Used to enumerate
+   * connectors for a run (e.g. Composio manifest building) where the agent's
+   * own connector should shadow the base one.
    */
   resolveAll = async (
-    agentId?: string,
+    target: ConnectorRunTarget = {},
     gateKeeper: GateKeeper | undefined = this.gateKeeper,
   ): Promise<DecryptedConnector[]> => {
     const rows = await this.db
       .select()
       .from(userConnectors)
-      .where(this.scopePredicate(agentId))
+      .where(this.scopePredicate(target))
       .orderBy(...this.resolutionOrder());
 
-    return Promise.all(this.pickByPriority(rows, agentId).map((r) => decryptRow(r, gateKeeper)));
+    return Promise.all(
+      this.pickByPriority(rows, target.agentId).map((r) => decryptRow(r, gateKeeper)),
+    );
   };
 
   /**
@@ -437,12 +521,23 @@ export class ConnectorModel {
    * {@link resolveByIdentifiers} it does NOT fall back across scopes, so
    * creating an agent connector never updates the personal/workspace row and
    * vice versa.
+   *
+   * In a workspace a base row is looked up within one visibility: the shared
+   * row (default), or the caller's own private row. Adding a private
+   * connector therefore never rewrites the shared one of the same identifier.
    */
   findScopedByIdentifier = async (
     identifier: string,
     agentId?: string,
     gateKeeper: GateKeeper | undefined = this.gateKeeper,
+    visibility: ConnectorVisibility = 'public',
   ): Promise<DecryptedConnector | null> => {
+    const sameVisibility =
+      !agentId && normalizeWorkspaceId(this.workspaceId)
+        ? visibility === 'private'
+          ? and(eq(userConnectors.visibility, 'private'), eq(userConnectors.userId, this.userId))
+          : eq(userConnectors.visibility, 'public')
+        : undefined;
     const [row] = await this.db
       .select()
       .from(userConnectors)
@@ -451,6 +546,7 @@ export class ConnectorModel {
           this.ownership(),
           eq(userConnectors.identifier, identifier),
           agentId ? eq(userConnectors.agentId, agentId) : isNull(userConnectors.agentId),
+          sameVisibility,
         ),
       )
       .limit(1);
@@ -469,7 +565,7 @@ export class ConnectorModel {
         status: userConnectors.status,
       })
       .from(userConnectors)
-      .where(and(this.baseScope(), inArray(userConnectors.identifier, identifiers)));
+      .where(and(this.sharedBaseScope(), inArray(userConnectors.identifier, identifiers)));
   };
 
   queryComposioReferencesByIdentifiers = async (
@@ -486,7 +582,7 @@ export class ConnectorModel {
         userId: userConnectors.userId,
       })
       .from(userConnectors)
-      .where(and(this.baseScope(), inArray(userConnectors.identifier, identifiers)));
+      .where(and(this.sharedBaseScope(), inArray(userConnectors.identifier, identifiers)));
 
     return rows.map(toComposioConnectorReference);
   };

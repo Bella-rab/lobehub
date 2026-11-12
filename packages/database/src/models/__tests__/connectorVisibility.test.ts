@@ -1,0 +1,429 @@
+import { RequestTrigger } from '@lobechat/types';
+import { eq } from 'drizzle-orm';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { getTestDB } from '../../core/getTestDB';
+import {
+  agents,
+  chatGroups,
+  topics,
+  userConnectors,
+  userConnectorTools,
+  users,
+  workspaces,
+} from '../../schemas';
+import type { LobeChatDatabase } from '../../type';
+import { CHANNEL_TOPIC_TRIGGER } from '../../utils/topicVisibility';
+import { ConnectorModel } from '../connector';
+import { ConnectorToolModel } from '../connectorTool';
+
+const serverDB: LobeChatDatabase = await getTestDB();
+
+const owner = 'cv-owner';
+const mate = 'cv-mate';
+const workspaceId = 'cv-ws';
+const privateAgent = 'cv-agent-private';
+const workspaceAgent = 'cv-agent-workspace';
+const matePrivateAgent = 'cv-agent-mate-private';
+const privateTopic = 'cv-topic-private';
+const workspaceAgentTopic = 'cv-topic-workspace-agent';
+
+const insertConnector = async (row: {
+  agentId?: string | null;
+  identifier: string;
+  metadata?: Record<string, unknown> | null;
+  name?: string;
+  userId?: string;
+  visibility?: 'private' | 'public';
+  workspaceId?: string | null;
+}) => {
+  const [created] = await serverDB
+    .insert(userConnectors)
+    .values({
+      agentId: row.agentId ?? null,
+      identifier: row.identifier,
+      mcpConnectionType: 'http',
+      mcpServerUrl: `https://${row.identifier}.example.com/mcp`,
+      metadata: row.metadata ?? null,
+      name: row.name ?? row.identifier,
+      sourceType: 'custom',
+      status: 'connected',
+      userId: row.userId ?? owner,
+      visibility: row.visibility ?? 'public',
+      workspaceId: row.workspaceId === undefined ? workspaceId : row.workspaceId,
+    })
+    .returning();
+  return created;
+};
+
+const insertTopic = async (row: {
+  agentId?: string;
+  groupId?: string;
+  id: string;
+  senderId?: string;
+  trigger?: string;
+  userId?: string;
+}) => {
+  await serverDB.insert(topics).values({
+    agentId: row.agentId ?? privateAgent,
+    groupId: row.groupId,
+    id: row.id,
+    senderId: row.senderId,
+    trigger: row.trigger,
+    userId: row.userId ?? owner,
+    workspaceId,
+  });
+};
+
+/**
+ * The connector identifiers a run resolves, sorted. Each fixture row uses a
+ * distinct identifier unless a test is about collisions.
+ */
+const resolvedIdentifiers = async (
+  model: ConnectorModel,
+  target: { agentId?: string; topicId?: string },
+) => (await model.resolveAll(target)).map((row) => row.identifier).sort();
+
+beforeEach(async () => {
+  await serverDB.delete(users);
+  await serverDB.insert(users).values([{ id: owner }, { id: mate }]);
+  await serverDB
+    .insert(workspaces)
+    .values({ id: workspaceId, name: 'WS', primaryOwnerId: owner, slug: 'cv-ws' });
+  await serverDB.insert(agents).values([
+    { id: privateAgent, userId: owner, visibility: 'private', workspaceId },
+    { id: workspaceAgent, userId: owner, visibility: 'public', workspaceId },
+    { id: matePrivateAgent, userId: mate, visibility: 'private', workspaceId },
+  ]);
+  await insertTopic({ id: privateTopic });
+  await insertTopic({ agentId: workspaceAgent, id: workspaceAgentTopic });
+});
+
+afterEach(async () => {
+  await serverDB.delete(users);
+});
+
+/** Workspace shared + the owner's private + the owner's personal, plus a teammate's private. */
+const seedConnectors = async () => {
+  await insertConnector({ identifier: 'ws-shared-linear', userId: mate });
+  await insertConnector({ identifier: 'owner-private-notion', visibility: 'private' });
+  await insertConnector({ identifier: 'owner-personal-gmail', workspaceId: null });
+  await insertConnector({ identifier: 'mate-private-slack', userId: mate, visibility: 'private' });
+  await insertConnector({ identifier: 'mate-personal-github', userId: mate, workspaceId: null });
+};
+
+describe('connector visibility — management view', () => {
+  it('lists the shared rows plus only the caller’s own private rows', async () => {
+    await seedConnectors();
+
+    const ownerList = (await new ConnectorModel(serverDB, owner, workspaceId).query())
+      .map((row) => row.identifier)
+      .sort();
+    const mateList = (await new ConnectorModel(serverDB, mate, workspaceId).query())
+      .map((row) => row.identifier)
+      .sort();
+
+    expect(ownerList).toEqual(['owner-private-notion', 'ws-shared-linear']);
+    expect(mateList).toEqual(['mate-private-slack', 'ws-shared-linear']);
+  });
+
+  it('hides a private row from a teammate looking it up by id', async () => {
+    const privateRow = await insertConnector({ identifier: 'notion', visibility: 'private' });
+
+    expect(
+      await new ConnectorModel(serverDB, mate, workspaceId).findById(privateRow.id),
+    ).toBeNull();
+    expect(
+      (await new ConnectorModel(serverDB, owner, workspaceId).findById(privateRow.id))?.id,
+    ).toBe(privateRow.id);
+  });
+
+  it('exposes the visibility on public records', async () => {
+    await insertConnector({ identifier: 'notion', visibility: 'private' });
+
+    const [record] = await new ConnectorModel(serverDB, owner, workspaceId).queryPublic();
+
+    expect(record.visibility).toBe('private');
+  });
+});
+
+describe('connector visibility — runtime resolution', () => {
+  it('gives a private agent the shared rows plus its owner’s private and personal rows', async () => {
+    await seedConnectors();
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(model, { agentId: privateAgent, topicId: privateTopic }),
+    ).toEqual(['owner-personal-gmail', 'owner-private-notion', 'ws-shared-linear']);
+  });
+
+  it('gives a workspace agent the shared rows only', async () => {
+    await seedConnectors();
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(model, { agentId: workspaceAgent, topicId: workspaceAgentTopic }),
+    ).toEqual(['ws-shared-linear']);
+  });
+
+  it('keeps private rows out when the run names no topic', async () => {
+    await seedConnectors();
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(await resolvedIdentifiers(model, { agentId: privateAgent })).toEqual([
+      'ws-shared-linear',
+    ]);
+    expect(await resolvedIdentifiers(model, {})).toEqual(['ws-shared-linear']);
+  });
+
+  it.each([
+    ['a group topic', { groupId: 'cv-group' }],
+    ['a channel run topic', { trigger: CHANNEL_TOPIC_TRIGGER }],
+    ['a bot topic', { trigger: RequestTrigger.Bot }],
+    ['an agent-share topic', { trigger: RequestTrigger.AgentShare }],
+    ['a share visitor topic', { senderId: 'visitor-1' }],
+    ['a topic of another agent', { agentId: workspaceAgent }],
+  ])('keeps private rows out of %s', async (_label, topic) => {
+    await serverDB
+      .insert(chatGroups)
+      .values({ id: 'cv-group', title: 'Group', userId: owner, workspaceId });
+    await insertTopic({ id: 'cv-topic-shared-surface', ...topic });
+    await seedConnectors();
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(model, {
+        agentId: privateAgent,
+        topicId: 'cv-topic-shared-surface',
+      }),
+    ).toEqual(['ws-shared-linear']);
+  });
+
+  it('never resolves the owner’s private rows for anyone else', async () => {
+    await seedConnectors();
+    // A teammate naming the owner's private agent and topic gets nothing private:
+    // the agent and topic must belong to the caller.
+    const mateModel = new ConnectorModel(serverDB, mate, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(mateModel, { agentId: privateAgent, topicId: privateTopic }),
+    ).toEqual(['ws-shared-linear']);
+  });
+
+  it('gives a teammate’s private agent the teammate’s private rows, not the owner’s', async () => {
+    await insertTopic({ agentId: matePrivateAgent, id: 'cv-topic-mate', userId: mate });
+    await seedConnectors();
+    const mateModel = new ConnectorModel(serverDB, mate, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(mateModel, { agentId: matePrivateAgent, topicId: 'cv-topic-mate' }),
+    ).toEqual(['mate-personal-github', 'mate-private-slack', 'ws-shared-linear']);
+  });
+
+  it('does not resolve a private row mounted by a workspace agent', async () => {
+    await insertConnector({
+      identifier: 'notion',
+      metadata: { mountedByAgentId: workspaceAgent },
+      visibility: 'private',
+    });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(
+      await resolvedIdentifiers(model, { agentId: workspaceAgent, topicId: workspaceAgentTopic }),
+    ).toEqual([]);
+  });
+
+  it('leaves personal-mode resolution unchanged', async () => {
+    await seedConnectors();
+    const personal = new ConnectorModel(serverDB, owner);
+
+    expect(await resolvedIdentifiers(personal, {})).toEqual(['owner-personal-gmail']);
+  });
+
+  it('keeps agentless identifier lookups to the shared rows', async () => {
+    await insertConnector({ identifier: 'notion', visibility: 'private' });
+    const shared = await insertConnector({ identifier: 'notion', userId: mate });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect((await model.queryByIdentifiers(['notion'])).map((row) => row.id)).toEqual([shared.id]);
+    expect((await model.queryReferencesByIdentifiers(['notion'])).map((row) => row.id)).toEqual([
+      shared.id,
+    ]);
+  });
+});
+
+describe('connector visibility — priority within one identifier', () => {
+  it('prefers the owner’s workspace-private row, then personal, then shared', async () => {
+    const shared = await insertConnector({ identifier: 'gmail', userId: mate });
+    const personal = await insertConnector({ identifier: 'gmail', workspaceId: null });
+    const workspacePrivate = await insertConnector({ identifier: 'gmail', visibility: 'private' });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+    const target = { agentId: privateAgent, topicId: privateTopic };
+
+    expect((await model.resolveByIdentifiers(['gmail'], target)).map((r) => r.id)).toEqual([
+      workspacePrivate.id,
+    ]);
+
+    await serverDB.delete(userConnectors).where(eq(userConnectors.id, workspacePrivate.id));
+    expect((await model.resolveByIdentifiers(['gmail'], target)).map((r) => r.id)).toEqual([
+      personal.id,
+    ]);
+
+    await serverDB.delete(userConnectors).where(eq(userConnectors.id, personal.id));
+    expect((await model.resolveByIdentifiers(['gmail'], target)).map((r) => r.id)).toEqual([
+      shared.id,
+    ]);
+  });
+
+  it('lets an agent binding outrank whose connection it is', async () => {
+    await insertConnector({ identifier: 'gmail', visibility: 'private' });
+    const agentOwned = await insertConnector({ agentId: privateAgent, identifier: 'gmail' });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(
+      (
+        await model.resolveByIdentifiers(['gmail'], {
+          agentId: privateAgent,
+          topicId: privateTopic,
+        })
+      ).map((r) => r.id),
+    ).toEqual([agentOwned.id]);
+  });
+
+  it('breaks a tie by id, not by physical row order', async () => {
+    const [first, second] = [
+      await insertConnector({ identifier: 'gmail', userId: mate }),
+      await insertConnector({ identifier: 'gmail', userId: owner }),
+    ].sort((a, b) => a.id.localeCompare(b.id));
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+    // Touch the lower id so it moves to the end of the heap.
+    await serverDB
+      .update(userConnectors)
+      .set({ name: 'touched' })
+      .where(eq(userConnectors.id, first.id));
+
+    const [picked] = await model.resolveByIdentifiers(['gmail'], {
+      agentId: privateAgent,
+      topicId: privateTopic,
+    });
+
+    expect(picked.id).toBe(first.id);
+    expect(picked.id).not.toBe(second.id);
+  });
+});
+
+describe('connector visibility — write paths', () => {
+  it('looks up the idempotency row within one visibility', async () => {
+    const shared = await insertConnector({ identifier: 'notion', userId: mate });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect((await model.findScopedByIdentifier('notion'))?.id).toBe(shared.id);
+    expect(
+      await model.findScopedByIdentifier('notion', undefined, undefined, 'private'),
+    ).toBeNull();
+
+    const mine = await insertConnector({ identifier: 'notion', visibility: 'private' });
+    expect(
+      (await model.findScopedByIdentifier('notion', undefined, undefined, 'private'))?.id,
+    ).toBe(mine.id);
+    // A teammate's private row of the same identifier is never "mine".
+    await insertConnector({ identifier: 'slack', userId: mate, visibility: 'private' });
+    expect(await model.findScopedByIdentifier('slack', undefined, undefined, 'private')).toBeNull();
+  });
+
+  it('writes a personal row resolved in a workspace run through its personal scope', async () => {
+    const personal = await insertConnector({ identifier: 'gmail', workspaceId: null });
+    const workspaceModel = new ConnectorModel(serverDB, owner, workspaceId);
+
+    // The workspace model alone cannot reach the personal row.
+    await workspaceModel.update(personal.id, { name: 'via workspace' });
+    expect(
+      (await serverDB.select().from(userConnectors).where(eq(userConnectors.id, personal.id)))[0]
+        .name,
+    ).toBe('gmail');
+
+    await workspaceModel.forRow(personal).update(personal.id, { name: 'via home scope' });
+    expect(
+      (await serverDB.select().from(userConnectors).where(eq(userConnectors.id, personal.id)))[0]
+        .name,
+    ).toBe('via home scope');
+  });
+
+  it('never re-homes a teammate’s or a workspace row', async () => {
+    const workspaceModel = new ConnectorModel(serverDB, owner, workspaceId);
+    const matePersonal = await insertConnector({
+      identifier: 'github',
+      userId: mate,
+      workspaceId: null,
+    });
+    const shared = await insertConnector({ identifier: 'linear' });
+
+    expect(workspaceModel.forRow(matePersonal)).toBe(workspaceModel);
+    expect(workspaceModel.forRow(shared)).toBe(workspaceModel);
+  });
+});
+
+describe('connector visibility — tool rows of a resolved personal connector', () => {
+  const insertTool = async (connector: {
+    id: string;
+    userId: string;
+    workspaceId: string | null;
+  }) =>
+    serverDB.insert(userConnectorTools).values({
+      crudType: 'read',
+      permission: 'auto',
+      toolName: 'search',
+      userConnectorId: connector.id,
+      userId: connector.userId,
+      workspaceId: connector.workspaceId,
+    });
+
+  it('lets the workspace run read the caller’s own personal connector tools by id', async () => {
+    const personal = await insertConnector({ identifier: 'gmail', workspaceId: null });
+    await insertTool(personal);
+    const toolModel = new ConnectorToolModel(serverDB, owner, workspaceId, { agentRun: true });
+
+    expect((await toolModel.queryAllByConnectorIds([personal.id])).map((t) => t.toolName)).toEqual([
+      'search',
+    ]);
+    expect((await toolModel.queryByConnector(personal.id)).map((t) => t.toolName)).toEqual([
+      'search',
+    ]);
+    // Name lookups without a resolved connector stay strictly scoped.
+    expect(await toolModel.findByToolName('search')).toBeUndefined();
+  });
+
+  it('never reads a teammate’s personal connector tools', async () => {
+    const matePersonal = await insertConnector({
+      identifier: 'github',
+      userId: mate,
+      workspaceId: null,
+    });
+    await insertTool(matePersonal);
+    const toolModel = new ConnectorToolModel(serverDB, owner, workspaceId, { agentRun: true });
+
+    expect(await toolModel.queryAllByConnectorIds([matePersonal.id])).toEqual([]);
+  });
+
+  it('hides a teammate’s private connector tools', async () => {
+    const matePrivate = await insertConnector({
+      identifier: 'slack',
+      userId: mate,
+      visibility: 'private',
+    });
+    await insertTool(matePrivate);
+
+    expect(
+      await new ConnectorToolModel(serverDB, owner, workspaceId, {
+        agentRun: true,
+      }).queryByConnector(matePrivate.id),
+    ).toEqual([]);
+    expect(
+      (
+        await new ConnectorToolModel(serverDB, mate, workspaceId, {
+          agentRun: true,
+        }).queryByConnector(matePrivate.id)
+      ).length,
+    ).toBe(1);
+  });
+});
