@@ -331,6 +331,67 @@ describe('connector visibility — write paths', () => {
     expect(await model.findScopedByIdentifier('slack', undefined, undefined, 'private')).toBeNull();
   });
 
+  it('targets the row holding the Composio account a write names', async () => {
+    const composio = (connectedAccountId: string) => ({ composio: { connectedAccountId } });
+    const shared = await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-shared'),
+      userId: mate,
+    });
+    const mine = await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-mine'),
+      visibility: 'private',
+    });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    // Removing or refreshing the shared account (Settings lists it) must not
+    // land on the caller's private connection of the same app.
+    expect((await model.findManageableByIdentifier('gmail', undefined, 'acc-shared'))?.id).toBe(
+      shared.id,
+    );
+    expect((await model.findManageableByIdentifier('gmail', undefined, 'acc-mine'))?.id).toBe(
+      mine.id,
+    );
+    // A new connection (no account yet) keeps the private row first.
+    expect((await model.findManageableByIdentifier('gmail'))?.id).toBe(mine.id);
+    expect((await model.findManageableByIdentifier('gmail', undefined, 'acc-new'))?.id).toBe(
+      mine.id,
+    );
+  });
+
+  it('tells when a Composio account sits on a teammate’s private connector', async () => {
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: { composio: { connectedAccountId: 'acc-mate' } },
+      userId: mate,
+      visibility: 'private',
+    });
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: { composio: { connectedAccountId: 'acc-shared' } },
+      userId: mate,
+    });
+    const ownerModel = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(await ownerModel.isComposioAccountPrivateToTeammate('gmail', 'acc-mate')).toBe(true);
+    expect(await ownerModel.isComposioAccountPrivateToTeammate('gmail', 'acc-shared')).toBe(false);
+    // The teammate's own row is not "a teammate's" to them, and nothing is
+    // private outside a workspace.
+    expect(
+      await new ConnectorModel(serverDB, mate, workspaceId).isComposioAccountPrivateToTeammate(
+        'gmail',
+        'acc-mate',
+      ),
+    ).toBe(false);
+    expect(
+      await new ConnectorModel(serverDB, owner).isComposioAccountPrivateToTeammate(
+        'gmail',
+        'acc-mate',
+      ),
+    ).toBe(false);
+  });
+
   it('writes a personal row resolved in a workspace run through its personal scope', async () => {
     const personal = await insertConnector({ identifier: 'gmail', workspaceId: null });
     const workspaceModel = new ConnectorModel(serverDB, owner, workspaceId);

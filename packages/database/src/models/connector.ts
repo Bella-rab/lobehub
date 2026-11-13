@@ -1,5 +1,5 @@
 import type { ConnectorVisibility } from '@lobechat/types';
-import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import pMap from 'p-map';
 
 import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
@@ -564,12 +564,17 @@ export class ConnectorModel {
    * private makes the next refresh miss it and create a second, public row for
    * the same account — republishing it to the workspace.
    *
-   * The caller's own private row wins over the shared one, matching
+   * A write for a known Composio account (a refresh, a removal) targets the
+   * row holding that account: the caller may keep a private row and see a
+   * shared one of the same identifier, and the account names which of the two
+   * the write is about. Otherwise — a new connection, or an account no row
+   * holds — the caller's own private row wins over the shared one, matching
    * {@link pickByPriority}.
    */
   findManageableByIdentifier = async (
     identifier: string,
     agentId?: string,
+    composioAccountId?: string,
   ): Promise<{
     agentId: string | null;
     id: string;
@@ -596,7 +601,42 @@ export class ConnectorModel {
       .orderBy(asc(userConnectors.id));
 
     if (rows.length === 0) return null;
-    return rows.find((row) => row.visibility === 'private') ?? rows[0];
+    const holdsAccount =
+      composioAccountId &&
+      rows.find((row) => row.metadata?.composio?.connectedAccountId === composioAccountId);
+    return holdsAccount || rows.find((row) => row.visibility === 'private') || rows[0];
+  };
+
+  /**
+   * Whether a teammate's private connector in this workspace holds this
+   * Composio account. The legacy plugin projection is workspace-wide, so every
+   * member can still read a privatized connection's account id from it; a
+   * write naming that account must not reach the account through a row the
+   * caller can see instead (deleting the remote account, or copying it onto a
+   * shared row). Always false outside a workspace, where nothing is private.
+   */
+  isComposioAccountPrivateToTeammate = async (
+    identifier: string,
+    composioAccountId: string,
+  ): Promise<boolean> => {
+    const workspaceId = normalizeWorkspaceId(this.workspaceId);
+    if (!workspaceId) return false;
+
+    const [row] = await this.db
+      .select({ id: userConnectors.id })
+      .from(userConnectors)
+      .where(
+        and(
+          eq(userConnectors.workspaceId, workspaceId),
+          eq(userConnectors.identifier, identifier),
+          eq(userConnectors.visibility, 'private'),
+          ne(userConnectors.userId, this.userId),
+          sql`${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId' = ${composioAccountId}`,
+        ),
+      )
+      .limit(1);
+
+    return !!row;
   };
 
   /**
