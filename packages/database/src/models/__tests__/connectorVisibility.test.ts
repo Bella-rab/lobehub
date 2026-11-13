@@ -397,9 +397,23 @@ describe('connector visibility — write paths', () => {
     );
     // A new connection (no account yet) keeps the private row first.
     expect((await model.findManageableByIdentifier('gmail'))?.id).toBe(mine.id);
-    expect((await model.findManageableByIdentifier('gmail', undefined, 'acc-new'))?.id).toBe(
-      mine.id,
+    // An account no row holds is a legacy, workspace-wide connection: it lands
+    // on the shared row, never in the caller's private one.
+    expect((await model.findManageableByIdentifier('gmail', undefined, 'acc-legacy'))?.id).toBe(
+      shared.id,
     );
+  });
+
+  it('never adopts a legacy Composio account into the caller’s private row', async () => {
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: { composio: { connectedAccountId: 'acc-mine' } },
+      visibility: 'private',
+    });
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    // No shared row yet: the write creates one under the shared policy.
+    expect(await model.findManageableByIdentifier('gmail', undefined, 'acc-legacy')).toBeNull();
   });
 
   it('tells when a Composio account sits on a teammate’s private connector', async () => {
@@ -463,6 +477,112 @@ describe('connector visibility — write paths', () => {
 
     expect(workspaceModel.forRow(matePersonal)).toBe(workspaceModel);
     expect(workspaceModel.forRow(shared)).toBe(workspaceModel);
+  });
+});
+
+describe('connector visibility — legacy Composio projection', () => {
+  const composio = (connectedAccountId: string, linkedByUserId?: string) => ({
+    composio: { connectedAccountId, ...(linkedByUserId && { linkedByUserId }) },
+  });
+  /** The owner's legacy connection, as the workspace-wide plugin projection holds it. */
+  const legacy = { connectedAccountId: 'acc-legacy', identifier: 'gmail', ownerUserId: owner };
+  const legacyFor = (userId: string) =>
+    new ConnectorModel(serverDB, userId, workspaceId).pickLegacyComposioMirrors([legacy]);
+
+  it('keeps a teammate’s legacy connection when a member adds a private connector of the app', async () => {
+    // ROOT CAUSE:
+    //
+    // Any connector row of the identifier counted as the projection's connector,
+    // so a member's private row — added without the shared connector policy —
+    // took the legacy connection away from every other member.
+    await insertConnector({ identifier: 'gmail', userId: mate, visibility: 'private' });
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-mate', mate),
+      userId: mate,
+      visibility: 'private',
+    });
+
+    expect(await legacyFor(owner)).toEqual([legacy]);
+    expect(await legacyFor(mate)).toEqual([legacy]);
+  });
+
+  it('keeps it when a member writes the legacy account id into their own row', async () => {
+    // Every member reads the projection's account ids, and a connector's
+    // metadata is client-written: an account id alone proves nothing.
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-legacy'),
+      userId: mate,
+      visibility: 'private',
+    });
+    await insertConnector({
+      agentId: matePrivateAgent,
+      identifier: 'gmail',
+      metadata: composio('acc-legacy'),
+      userId: mate,
+    });
+
+    expect(await legacyFor(mate)).toEqual([legacy]);
+  });
+
+  it('withholds the mirror of a connector its creator made private', async () => {
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-legacy', owner),
+      visibility: 'private',
+    });
+
+    expect(await legacyFor(mate)).toEqual([]);
+  });
+
+  it('withholds the mirror of an account an agent row now runs', async () => {
+    await insertConnector({
+      agentId: workspaceAgent,
+      identifier: 'gmail',
+      metadata: composio('acc-legacy'),
+    });
+
+    expect(await legacyFor(mate)).toEqual([]);
+  });
+
+  it('withholds the previous account while its linker reconnects the app', async () => {
+    // The private row already holds the new, still pending account; the
+    // projection rows of other members still carry the previous one.
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-reconnecting', owner),
+      visibility: 'private',
+    });
+
+    expect(await legacyFor(mate)).toEqual([]);
+    // A mirror of another app, or linked by someone else, is unaffected.
+    expect(
+      await new ConnectorModel(serverDB, mate, workspaceId).pickLegacyComposioMirrors([
+        { ...legacy, identifier: 'slack' },
+        { ...legacy, ownerUserId: mate },
+      ]),
+    ).toEqual([
+      { ...legacy, identifier: 'slack' },
+      { ...legacy, ownerUserId: mate },
+    ]);
+  });
+
+  it('looks at the caller’s own rows outside a workspace', async () => {
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: composio('acc-legacy', owner),
+      workspaceId: null,
+    });
+
+    expect(await new ConnectorModel(serverDB, owner).pickLegacyComposioMirrors([legacy])).toEqual(
+      [],
+    );
+    expect(
+      await new ConnectorModel(serverDB, mate).pickLegacyComposioMirrors([
+        { ...legacy, ownerUserId: mate },
+      ]),
+    ).toEqual([{ ...legacy, ownerUserId: mate }]);
   });
 });
 

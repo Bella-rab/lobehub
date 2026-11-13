@@ -67,6 +67,21 @@ export interface ComposioConnectorReference extends ConnectorReference {
   };
 }
 
+/**
+ * A Composio account held by the legacy plugin projection
+ * (`user_installed_plugins.customParams.composio`).
+ */
+export interface ComposioPluginMirror {
+  connectedAccountId: string;
+  identifier: string;
+  /**
+   * The Composio user entity the projection runs the account as
+   * (`linkedByUserId`, else the projection row's user), the same owner the
+   * runtime passes to Composio.
+   */
+  ownerUserId: string;
+}
+
 type CreateConnectorParams = Omit<NewUserConnector, 'userId' | 'id' | 'createdAt' | 'updatedAt'>;
 
 type UpdateConnectorParams = Partial<
@@ -613,9 +628,13 @@ export class ConnectorModel {
    * A write for a known Composio account (a refresh, a removal) targets the
    * row holding that account: the caller may keep a private row and see a
    * shared one of the same identifier, and the account names which of the two
-   * the write is about. Otherwise — a new connection, or an account no row
-   * holds — the caller's own private row wins over the shared one, matching
-   * {@link pickByPriority}.
+   * the write is about. An account no row holds is a legacy connection, which
+   * lives in the workspace-wide plugin projection: it belongs to the shared
+   * scope, so the write targets the shared row (or creates one) under the
+   * shared connector policy, and never adopts the account into the caller's
+   * private row, where it would vanish from every other member. A new
+   * connection (no account yet) prefers the caller's own private row over the
+   * shared one, matching {@link pickByPriority}.
    */
   findManageableByIdentifier = async (
     identifier: string,
@@ -647,10 +666,13 @@ export class ConnectorModel {
       .orderBy(asc(userConnectors.id));
 
     if (rows.length === 0) return null;
-    const holdsAccount =
-      composioAccountId &&
-      rows.find((row) => row.metadata?.composio?.connectedAccountId === composioAccountId);
-    return holdsAccount || rows.find((row) => row.visibility === 'private') || rows[0];
+    if (composioAccountId) {
+      const holdsAccount = rows.find(
+        (row) => row.metadata?.composio?.connectedAccountId === composioAccountId,
+      );
+      return holdsAccount ?? rows.find((row) => row.visibility !== 'private') ?? null;
+    }
+    return rows.find((row) => row.visibility === 'private') ?? rows[0];
   };
 
   /**
@@ -686,35 +708,73 @@ export class ConnectorModel {
   };
 
   /**
-   * Identifiers that already have a connector row anywhere in this
-   * workspace (or, outside a workspace, in the caller's personal scope):
-   * every visibility and every agent binding, whoever created the row.
+   * The plugin-projection accounts that are still legacy connections: no
+   * Composio connector row anywhere in this workspace (or, outside a
+   * workspace, in the caller's personal scope) is the connector they mirror.
    *
-   * Runtime resolution deliberately narrows to what the run may see, so an
-   * identifier can come back empty while the row still exists — a private
-   * connector read by someone else, another agent's row, a mount this agent
-   * did not get. Legacy paths (the plugin projection a connector is mirrored
-   * into) must not resurrect it from the other side: once a connector row
-   * exists the projection is a mirror of that row, so "no visible row" means
-   * "not available in this run", not "fall back to the old path".
+   * Runtime resolution deliberately narrows to what the run may see, so a
+   * connection can resolve to nothing while its connector row still exists —
+   * a private connector read by someone else, another agent's row. The
+   * projection is a mirror of that row, and serving it would resurrect the
+   * very connection the run is not allowed to use. A mirror belongs to a
+   * Composio row of its identifier, in any visibility, that:
+   *
+   * - runs the same account as the same Composio entity
+   *   (`linkedByUserId`, else the row creator — what the runtime passes to
+   *   Composio), whatever agent it is bound to; or
+   * - is a base row created or linked by the mirror's entity: that user
+   *   connected this app again, so the account still in the projection is
+   *   the connection's past (a reconnect not finished yet), not a legacy
+   *   connection to hand to the workspace.
+   *
+   * Both tests rest on server-owned attribution. The identifier, and an
+   * account id alone, prove nothing: any member can add a private connector
+   * of a supported identifier without passing the shared connector policy,
+   * and write any account id into its metadata (every member reads the
+   * projection's account ids), and that row must not take a teammate's
+   * legacy connection away from the rest of the workspace.
    */
-  identifiersWithConnectorRows = async (identifiers: string[]): Promise<Set<string>> => {
-    if (identifiers.length === 0) return new Set();
+  pickLegacyComposioMirrors = async <T extends ComposioPluginMirror>(
+    mirrors: T[],
+  ): Promise<T[]> => {
+    if (mirrors.length === 0) return [];
 
     const workspaceId = normalizeWorkspaceId(this.workspaceId);
     // In a workspace the whole workspace counts, including rows other members
-    // keep private: the projection is workspace-wide, so a row anyone owns
-    // means the identifier is already connector-backed.
+    // keep private: the projection is workspace-wide.
     const scope = workspaceId
       ? eq(userConnectors.workspaceId, workspaceId)
       : and(eq(userConnectors.userId, this.userId), isNull(userConnectors.workspaceId));
 
     const rows = await this.db
-      .selectDistinct({ identifier: userConnectors.identifier })
+      .select({
+        agentId: userConnectors.agentId,
+        connectedAccountId: sql<
+          string | null
+        >`${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId'`,
+        identifier: userConnectors.identifier,
+        linkedByUserId: sql<
+          string | null
+        >`${userConnectors.metadata} -> 'composio' ->> 'linkedByUserId'`,
+        userId: userConnectors.userId,
+      })
       .from(userConnectors)
-      .where(and(scope, inArray(userConnectors.identifier, identifiers)));
+      .where(
+        and(
+          scope,
+          inArray(userConnectors.identifier, [...new Set(mirrors.map((m) => m.identifier))]),
+          sql`${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId' IS NOT NULL`,
+        ),
+      );
 
-    return new Set(rows.map((row) => row.identifier));
+    const isMirrorOf = (mirror: ComposioPluginMirror, row: (typeof rows)[number]) =>
+      row.identifier === mirror.identifier &&
+      ((row.connectedAccountId === mirror.connectedAccountId &&
+        (row.linkedByUserId ?? row.userId) === mirror.ownerUserId) ||
+        (!row.agentId &&
+          (row.userId === mirror.ownerUserId || row.linkedByUserId === mirror.ownerUserId)));
+
+    return mirrors.filter((mirror) => !rows.some((row) => isMirrorOf(mirror, row)));
   };
 
   queryReferencesByIdentifiers = async (identifiers: string[]): Promise<ConnectorReference[]> => {
