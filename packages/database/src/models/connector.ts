@@ -1,6 +1,6 @@
 import type { ConnectorVisibility } from '@lobechat/types';
 import type { SQL } from 'drizzle-orm';
-import { and, asc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import pMap from 'p-map';
 
 import type { ConnectorCredentials, NewUserConnector, UserConnectorItem } from '../schemas';
@@ -676,35 +676,66 @@ export class ConnectorModel {
   };
 
   /**
-   * Whether a teammate's private connector in this workspace holds this
-   * Composio account. The legacy plugin projection is workspace-wide, so every
-   * member can still read a privatized connection's account id from it; a
-   * write naming that account must not reach the account through a row the
-   * caller can see instead (deleting the remote account, or copying it onto a
-   * shared row). Always false outside a workspace, where nothing is private.
+   * Every Composio connector row in scope that names this account: in a
+   * workspace any member's row, in any visibility and under any identifier,
+   * bound to an agent or not; outside a workspace the caller's personal rows.
+   *
+   * A write naming an account is judged on these rows, never on the identifier
+   * it also names. Every member reads the account ids of the workspace-wide
+   * plugin projection, so the identifier is theirs to choose, and a lookup
+   * keyed by it misses the row that actually runs the account. An account id
+   * in a row is no proof of ownership either: a connector's metadata is
+   * client-written, so a member can name a teammate's account in a row of
+   * their own.
    */
-  isComposioAccountPrivateToTeammate = async (
-    identifier: string,
+  queryComposioAccountHolders = async (
     composioAccountId: string,
-  ): Promise<boolean> => {
+  ): Promise<
+    {
+      agentId: string | null;
+      id: string;
+      identifier: string;
+      userId: string;
+      visibility: ConnectorVisibility;
+    }[]
+  > => {
     const workspaceId = normalizeWorkspaceId(this.workspaceId);
-    if (!workspaceId) return false;
 
-    const [row] = await this.db
-      .select({ id: userConnectors.id })
+    return this.db
+      .select({
+        agentId: userConnectors.agentId,
+        id: userConnectors.id,
+        identifier: userConnectors.identifier,
+        userId: userConnectors.userId,
+        visibility: userConnectors.visibility,
+      })
       .from(userConnectors)
       .where(
         and(
-          eq(userConnectors.workspaceId, workspaceId),
-          eq(userConnectors.identifier, identifier),
-          eq(userConnectors.visibility, 'private'),
-          ne(userConnectors.userId, this.userId),
+          workspaceId
+            ? eq(userConnectors.workspaceId, workspaceId)
+            : and(eq(userConnectors.userId, this.userId), isNull(userConnectors.workspaceId)),
           sql`${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId' = ${composioAccountId}`,
         ),
       )
-      .limit(1);
+      .orderBy(asc(userConnectors.id));
+  };
 
-    return !!row;
+  /**
+   * Whether a teammate's private connector in this workspace holds this
+   * Composio account, under any identifier (see
+   * {@link queryComposioAccountHolders}). The legacy plugin projection is
+   * workspace-wide, so every member can still read a privatized connection's
+   * account id from it; a write naming that account must not reach the
+   * account through a row the caller can see instead (deleting the remote
+   * account, or copying it onto a shared row). Always false outside a
+   * workspace, where nothing is private.
+   */
+  isComposioAccountPrivateToTeammate = async (composioAccountId: string): Promise<boolean> => {
+    if (!normalizeWorkspaceId(this.workspaceId)) return false;
+
+    const holders = await this.queryComposioAccountHolders(composioAccountId);
+    return holders.some((row) => row.visibility === 'private' && row.userId !== this.userId);
   };
 
   /**

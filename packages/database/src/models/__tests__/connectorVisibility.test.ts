@@ -430,22 +430,57 @@ describe('connector visibility — write paths', () => {
     });
     const ownerModel = new ConnectorModel(serverDB, owner, workspaceId);
 
-    expect(await ownerModel.isComposioAccountPrivateToTeammate('gmail', 'acc-mate')).toBe(true);
-    expect(await ownerModel.isComposioAccountPrivateToTeammate('gmail', 'acc-shared')).toBe(false);
+    expect(await ownerModel.isComposioAccountPrivateToTeammate('acc-mate')).toBe(true);
+    expect(await ownerModel.isComposioAccountPrivateToTeammate('acc-shared')).toBe(false);
     // The teammate's own row is not "a teammate's" to them, and nothing is
     // private outside a workspace.
     expect(
       await new ConnectorModel(serverDB, mate, workspaceId).isComposioAccountPrivateToTeammate(
-        'gmail',
         'acc-mate',
       ),
     ).toBe(false);
     expect(
-      await new ConnectorModel(serverDB, owner).isComposioAccountPrivateToTeammate(
-        'gmail',
-        'acc-mate',
-      ),
+      await new ConnectorModel(serverDB, owner).isComposioAccountPrivateToTeammate('acc-mate'),
     ).toBe(false);
+  });
+
+  it('finds a Composio account by the account alone, whatever identifier a write names', async () => {
+    // ROOT CAUSE:
+    //
+    // The private-account check also matched on the identifier the request
+    // named. A member who read a teammate's private account id from the
+    // workspace-wide projection sent it with another identifier, the check
+    // missed the teammate's row, and the remote account was deleted.
+    const matePrivate = await insertConnector({
+      identifier: 'gmail',
+      metadata: { composio: { connectedAccountId: 'acc-mate' } },
+      userId: mate,
+      visibility: 'private',
+    });
+    // A member's own row may name any account: its metadata is client-written.
+    const forged = await insertConnector({
+      identifier: 'github',
+      metadata: { composio: { connectedAccountId: 'acc-mate' } },
+      visibility: 'private',
+    });
+    await serverDB
+      .insert(workspaces)
+      .values({ id: 'cv-ws-other', name: 'Other', primaryOwnerId: mate, slug: 'cv-ws-other' });
+    await insertConnector({
+      identifier: 'gmail',
+      metadata: { composio: { connectedAccountId: 'acc-mate' } },
+      userId: mate,
+      workspaceId: 'cv-ws-other',
+    });
+    const ownerModel = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(await ownerModel.isComposioAccountPrivateToTeammate('acc-mate')).toBe(true);
+    // Both rows of this workspace that name the account, the teammate's private
+    // one included; another workspace's row is out of scope.
+    expect(
+      (await ownerModel.queryComposioAccountHolders('acc-mate')).map((row) => row.id).toSorted(),
+    ).toEqual([matePrivate.id, forged.id].toSorted());
+    expect(await ownerModel.queryComposioAccountHolders('acc-unknown')).toEqual([]);
   });
 
   it('writes a personal row resolved in a workspace run through its personal scope', async () => {
