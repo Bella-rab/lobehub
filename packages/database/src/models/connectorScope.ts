@@ -66,6 +66,45 @@ const NON_PRIVATE_TOPIC_TRIGGERS: string[] = [
   RequestTrigger.Bot,
 ];
 
+const personalRows = (userId: string) =>
+  and(eq(userConnectors.userId, userId), isNull(userConnectors.workspaceId), ordinaryConnection());
+
+const sharedRows = (workspaceId: string) =>
+  and(eq(userConnectors.workspaceId, workspaceId), eq(userConnectors.visibility, 'public'));
+
+/**
+ * The caller's private rows in this workspace and their personal rows, when
+ * `agentId` is the caller's own private agent in this workspace. Checked in SQL
+ * (an uncorrelated EXISTS, evaluated once per query), so a caller cannot widen
+ * the scope by naming an agent it does not own.
+ */
+const ownersPrivateRows = (
+  db: LobeChatDatabase,
+  userId: string,
+  workspaceId: string,
+  agentId: string,
+) =>
+  and(
+    eq(userConnectors.userId, userId),
+    or(
+      and(eq(userConnectors.workspaceId, workspaceId), eq(userConnectors.visibility, 'private')),
+      isNull(userConnectors.workspaceId),
+    ),
+    exists(
+      db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(
+          and(
+            eq(agents.id, agentId),
+            eq(agents.workspaceId, workspaceId),
+            eq(agents.userId, userId),
+            eq(agents.visibility, 'private'),
+          ),
+        ),
+    ),
+  );
+
 /**
  * Base connector rows (before the agent-owned / mount narrowing) a run may
  * resolve. Tool visibility follows the agent, never whoever is speaking:
@@ -93,32 +132,11 @@ export const connectorRunScope = (
   target: ConnectorRunTarget,
 ) => {
   const workspaceId = normalizeWorkspaceId(scope.workspaceId);
-  if (!workspaceId) {
-    return and(
-      eq(userConnectors.userId, scope.userId),
-      isNull(userConnectors.workspaceId),
-      ordinaryConnection(),
-    );
-  }
+  if (!workspaceId) return personalRows(scope.userId);
 
-  const shared = and(
-    eq(userConnectors.workspaceId, workspaceId),
-    eq(userConnectors.visibility, 'public'),
-  );
   const { agentId, topicId } = target;
-  if (!agentId || !topicId) return and(shared, ordinaryConnection());
+  if (!agentId || !topicId) return and(sharedRows(workspaceId), ordinaryConnection());
 
-  const privateAgentOfCaller = db
-    .select({ id: agents.id })
-    .from(agents)
-    .where(
-      and(
-        eq(agents.id, agentId),
-        eq(agents.workspaceId, workspaceId),
-        eq(agents.userId, scope.userId),
-        eq(agents.visibility, 'private'),
-      ),
-    );
   const ownDirectTopic = db
     .select({ id: topics.id })
     .from(topics)
@@ -133,15 +151,35 @@ export const connectorRunScope = (
         or(isNull(topics.trigger), notInArray(topics.trigger, NON_PRIVATE_TOPIC_TRIGGERS)),
       ),
     );
-  const ownersPrivate = and(
-    eq(userConnectors.userId, scope.userId),
-    or(
-      and(eq(userConnectors.workspaceId, workspaceId), eq(userConnectors.visibility, 'private')),
-      isNull(userConnectors.workspaceId),
-    ),
-    exists(privateAgentOfCaller),
-    exists(ownDirectTopic),
-  );
 
-  return and(or(shared, ownersPrivate), ordinaryConnection());
+  return and(
+    or(
+      sharedRows(workspaceId),
+      and(ownersPrivateRows(db, scope.userId, workspaceId, agentId), exists(ownDirectTopic)),
+    ),
+    ordinaryConnection(),
+  );
+};
+
+/**
+ * Base connector rows an agent's CONFIGURATION may name: what the agent loads
+ * in its own direct topic (see {@link connectorRunScope}), so an owner can pin
+ * their private connector on their private agent. Nothing runs and no result is
+ * written under this scope, which is why it needs no topic proof; a run still
+ * resolves through {@link connectorRunScope}, and in a group, channel or another
+ * agent's topic the private rows stay out.
+ */
+export const connectorAgentConfigScope = (
+  db: LobeChatDatabase,
+  scope: { userId: string; workspaceId?: string },
+  agentId?: string,
+) => {
+  const workspaceId = normalizeWorkspaceId(scope.workspaceId);
+  if (!workspaceId) return personalRows(scope.userId);
+  if (!agentId) return and(sharedRows(workspaceId), ordinaryConnection());
+
+  return and(
+    or(sharedRows(workspaceId), ownersPrivateRows(db, scope.userId, workspaceId, agentId)),
+    ordinaryConnection(),
+  );
 };

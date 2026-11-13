@@ -252,6 +252,48 @@ describe('connector visibility — runtime resolution', () => {
   });
 });
 
+describe('connector visibility — agent configuration', () => {
+  const availableIdentifiers = async (model: ConnectorModel, agentId?: string) =>
+    (await model.queryAvailableForAgent(agentId)).map((row) => row.identifier).sort();
+
+  it('offers a private agent its owner’s private and personal rows without a topic', async () => {
+    // Regression: validation ran the topic-free runtime scope, so Agent Builder
+    // refused to enable the owner's private connector on their private agent.
+    await seedConnectors();
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(await availableIdentifiers(model, privateAgent)).toEqual([
+      'owner-personal-gmail',
+      'owner-private-notion',
+      'ws-shared-linear',
+    ]);
+  });
+
+  it('offers a workspace agent, or a teammate naming the private agent, the shared rows only', async () => {
+    await seedConnectors();
+    const ownerModel = new ConnectorModel(serverDB, owner, workspaceId);
+    const mateModel = new ConnectorModel(serverDB, mate, workspaceId);
+
+    expect(await availableIdentifiers(ownerModel, workspaceAgent)).toEqual(['ws-shared-linear']);
+    expect(await availableIdentifiers(mateModel, privateAgent)).toEqual(['ws-shared-linear']);
+    expect(await availableIdentifiers(ownerModel)).toEqual(['ws-shared-linear']);
+  });
+
+  it('reports the row the agent’s own conversation ranks first, without credentials', async () => {
+    await insertConnector({ identifier: 'notion', userId: mate });
+    const privateRow = await insertConnector({ identifier: 'notion', visibility: 'private' });
+    await serverDB
+      .update(userConnectors)
+      .set({ isEnabled: false })
+      .where(eq(userConnectors.id, privateRow.id));
+    const model = new ConnectorModel(serverDB, owner, workspaceId);
+
+    expect(await model.queryAvailableForAgent(privateAgent)).toEqual([
+      { identifier: 'notion', isEnabled: false, status: 'connected' },
+    ]);
+  });
+});
+
 describe('connector visibility — priority within one identifier', () => {
   it('prefers the owner’s workspace-private row, then personal, then shared', async () => {
     const shared = await insertConnector({ identifier: 'gmail', userId: mate });

@@ -1,4 +1,5 @@
 import type { ConnectorVisibility } from '@lobechat/types';
+import type { SQL } from 'drizzle-orm';
 import { and, asc, eq, inArray, isNotNull, isNull, ne, or, sql } from 'drizzle-orm';
 import pMap from 'p-map';
 
@@ -11,7 +12,12 @@ import {
   normalizeWorkspaceId,
 } from '../utils/workspace';
 import { EvalConnectorUpdateError, normalizeEvalConnectorPatch } from './connectorEval';
-import { connectorAccessScope, connectorRunScope, type ConnectorRunTarget } from './connectorScope';
+import {
+  connectorAccessScope,
+  connectorAgentConfigScope,
+  connectorRunScope,
+  type ConnectorRunTarget,
+} from './connectorScope';
 
 export type { ConnectorRunTarget } from './connectorScope';
 
@@ -170,11 +176,20 @@ export class ConnectorModel {
    *
    * An evaluation model keeps its own Dataset scope ({@link ownership}).
    */
-  private scopePredicate = (target: ConnectorRunTarget) => {
-    const { agentId } = target;
-    const base = this.evaluationDatasetId
-      ? this.ownership()
-      : connectorRunScope(this.db, { userId: this.userId, workspaceId: this.workspaceId }, target);
+  private scopePredicate = (target: ConnectorRunTarget) =>
+    this.agentNarrowing(
+      this.evaluationDatasetId
+        ? this.ownership()
+        : connectorRunScope(
+            this.db,
+            { userId: this.userId, workspaceId: this.workspaceId },
+            target,
+          ),
+      target.agentId,
+    );
+
+  /** The agent-owned / mounted / free narrowing of {@link scopePredicate} over `base`. */
+  private agentNarrowing = (base: SQL | undefined, agentId?: string) => {
     // COALESCE'd to a sentinel rather than null-tested: `->> … IS NULL` in a
     // WHERE clause is one bm25 index on `user_connectors` away from taking every
     // caller down at plan time. See the note on `TopicModel`. `''` is a safe
@@ -513,6 +528,37 @@ export class ConnectorModel {
     return pMap(this.pickByPriority(rows, target.agentId), (r) => decryptRow(r, gateKeeper), {
       concurrency: 5,
     });
+  };
+
+  /**
+   * The connectors an agent's configuration may name, one per identifier,
+   * ranked as {@link resolveAll} ranks them in the agent's own conversation —
+   * without credentials. It needs no topic (see {@link connectorAgentConfigScope}):
+   * pinning a plugin id on an agent checks what the agent can load, so an owner
+   * can enable their private connector on their private agent. Use it to
+   * validate a configuration, never to run a tool.
+   */
+  queryAvailableForAgent = async (
+    agentId?: string,
+  ): Promise<Pick<UserConnectorItem, 'identifier' | 'isEnabled' | 'status'>[]> => {
+    const base = this.evaluationDatasetId
+      ? this.ownership()
+      : connectorAgentConfigScope(
+          this.db,
+          { userId: this.userId, workspaceId: this.workspaceId },
+          agentId,
+        );
+    const rows = await this.db
+      .select()
+      .from(userConnectors)
+      .where(this.agentNarrowing(base, agentId))
+      .orderBy(...this.resolutionOrder());
+
+    return this.pickByPriority(rows, agentId).map(({ identifier, isEnabled, status }) => ({
+      identifier,
+      isEnabled,
+      status,
+    }));
   };
 
   /**
