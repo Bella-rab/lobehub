@@ -763,7 +763,7 @@ export class ConnectorModel {
         and(
           scope,
           inArray(userConnectors.identifier, [...new Set(mirrors.map((m) => m.identifier))]),
-          sql`${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId' IS NOT NULL`,
+          sql`COALESCE(${userConnectors.metadata} -> 'composio' ->> 'connectedAccountId', '') <> ''`,
         ),
       );
 

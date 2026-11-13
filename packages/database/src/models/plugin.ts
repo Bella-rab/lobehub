@@ -131,7 +131,7 @@ export class PluginModel {
       .where(
         and(
           this.visible(),
-          sql`${userInstalledPlugins.customParams} -> 'composio' IS NOT NULL`,
+          sql`COALESCE(jsonb_exists(${userInstalledPlugins.customParams}, 'composio'), false)`,
           identifiers ? inArray(userInstalledPlugins.identifier, identifiers) : undefined,
         ),
       )
